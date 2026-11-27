@@ -121,7 +121,42 @@ class Y86Simulator:
         self.ifun = byte0 & 0x0F
         
         # TODO: 请在此处实现取指阶段的完整逻辑
-        pass
+        if self.icode not in range(I_HALT, I_POPQ + 1):
+            self.STAT = INS
+            return
+
+        if self.icode == I_HALT:
+            self.STAT = HLT
+            return
+
+        need_reg = self.icode in (
+            I_RRMOVQ, I_IRMOVQ, I_RMMOVQ, I_MRMOVQ,
+            I_ALU, I_PUSHQ, I_POPQ,
+        )
+        need_valC = self.icode in (
+            I_IRMOVQ, I_RMMOVQ, I_MRMOVQ, I_JMP, I_CALL,
+        )
+
+        self.rA = RNONE
+        self.rB = RNONE
+        self.valC = 0
+        next_pc = self.PC + 1
+
+        if need_reg:
+            reg_byte = self.read_mem(next_pc, 1)
+            if self.STAT != AOK:
+                return
+            self.rA = reg_byte >> 4
+            self.rB = reg_byte & 0x0F
+            next_pc += 1
+
+        if need_valC:
+            self.valC = self.read_mem(next_pc, 8)
+            if self.STAT != AOK:
+                return
+            next_pc += 8
+
+        self.valP = next_pc
 
     def decode(self):
         """
@@ -136,7 +171,18 @@ class Y86Simulator:
         srcB = RNONE
         
         # TODO: 请在此处实现译码阶段的完整逻辑，正确设置 srcA 和 srcB，并读取赋值给 valA 和 valB
-        pass
+        if self.icode in (I_RRMOVQ, I_RMMOVQ, I_ALU, I_PUSHQ):
+            srcA = self.rA
+        elif self.icode in (I_POPQ, I_RET):
+            srcA = RSP
+
+        if self.icode in (I_RMMOVQ, I_MRMOVQ, I_ALU):
+            srcB = self.rB
+        elif self.icode in (I_PUSHQ, I_POPQ, I_CALL, I_RET):
+            srcB = RSP
+
+        self.valA = 0 if srcA == RNONE else self.REG[srcA]
+        self.valB = 0 if srcB == RNONE else self.REG[srcB]
 
     def execute(self):
         """
@@ -162,7 +208,49 @@ class Y86Simulator:
         aluB = 0
         
         # TODO: 请在此处实现执行阶段的完整逻辑，包含 ALU 运算、条件码更新和分支跳转判定
-        pass
+        if self.icode in (I_RRMOVQ, I_ALU):
+            aluA = self.valA
+        elif self.icode in (I_IRMOVQ, I_RMMOVQ, I_MRMOVQ):
+            aluA = self.valC
+        elif self.icode in (I_CALL, I_PUSHQ):
+            aluA = -8
+        elif self.icode in (I_RET, I_POPQ):
+            aluA = 8
+
+        if self.icode in (
+            I_RMMOVQ, I_MRMOVQ, I_ALU,
+            I_CALL, I_RET, I_PUSHQ, I_POPQ,
+        ):
+            aluB = self.valB
+
+        if self.icode == I_ALU:
+            signedA = self.sign_extend(aluA)
+            signedB = self.sign_extend(aluB)
+
+            if self.ifun == 0:
+                result = signedB + signedA
+            elif self.ifun == 1:
+                result = signedB - signedA
+            elif self.ifun == 2:
+                result = aluB & aluA
+            elif self.ifun == 3:
+                result = aluB ^ aluA
+            else:
+                self.STAT = INS
+                return
+
+            self.valE = self.uint64(result)
+            self.CC["ZF"] = int(self.valE == 0)
+            self.CC["SF"] = int(bool(self.valE & (1 << 63)))
+            self.CC["OF"] = int(
+                self.ifun in (0, 1)
+                and not (-(1 << 63) <= result < (1 << 63))
+            )
+        else:
+            self.valE = self.uint64(aluB + aluA)
+
+        if self.icode in (I_RRMOVQ, I_JMP):
+            self.Cnd = self.check_cond(self.ifun)
 
     def memory_stage(self):
         """
@@ -177,8 +265,14 @@ class Y86Simulator:
         """
         self.valM = 0
         
-        # TODO: 请在此处实现访存阶段的完整读写逻辑
-        pass
+        if self.icode in (I_RMMOVQ, I_PUSHQ):
+            self.write_mem(self.valE, 8, self.valA)
+        elif self.icode == I_CALL:
+            self.write_mem(self.valE, 8, self.valP)
+        elif self.icode == I_MRMOVQ:
+            self.valM = self.read_mem(self.valE, 8)
+        elif self.icode in (I_POPQ, I_RET):
+            self.valM = self.read_mem(self.valA, 8)
 
     def write_back(self):
         """
@@ -195,7 +289,21 @@ class Y86Simulator:
         dstM = RNONE
         
         # TODO: 请在此处实现寄存器写回的完整逻辑
-        pass
+        if self.icode == I_RRMOVQ:
+            if self.Cnd:
+                dstE = self.rB
+        elif self.icode in (I_IRMOVQ, I_ALU):
+            dstE = self.rB
+        elif self.icode in (I_CALL, I_RET, I_PUSHQ, I_POPQ):
+            dstE = RSP
+
+        if self.icode in (I_MRMOVQ, I_POPQ):
+            dstM = self.rA
+
+        if dstE != RNONE:
+            self.REG[dstE] = self.valE
+        if dstM != RNONE:
+            self.REG[dstM] = self.valM
 
     def update_pc(self):
         """
@@ -207,8 +315,14 @@ class Y86Simulator:
         - ret 指令：PC 更新为从栈中弹出的返回地址 (valM)。
         - 其它默认情况：PC 顺序更新为下一条指令的地址 (valP)。
         """
-        # TODO: 请在此处实现 PC 更新逻辑
-        pass
+        if self.icode == I_CALL:
+            self.PC = self.valC
+        elif self.icode == I_JMP and self.Cnd:
+            self.PC = self.valC
+        elif self.icode == I_RET:
+            self.PC = self.valM
+        else:
+            self.PC = self.valP
 
     # ---------------- JSON 序列化输出 ----------------
     def dump_state(self):
